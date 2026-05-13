@@ -17,8 +17,8 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: eu-central-1
-  ECR_REPOSITORY: unicare/chat-api
+  AWS_REGION: il-central-1
+  ECR_REPOSITORY: chat-api-prod
 
 jobs:
   test:
