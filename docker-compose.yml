@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: chat-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  api:
+    build: .
+    container_name: chat-api
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      # optional: override these if needed
+      ENABLE_CORS: "true"
+      CORS_ORIGIN: http://localhost:3000
+      AUTH_KEY: TuJOoz/xjp1hzZFClLzWhp0rUNPMmjFwZZ3sOAtAzzI=
+      UPLOAD_DIR: uploads
+      PUBLIC_BASE_URL: http://localhost:4000
+    depends_on:
+      - mongo
+
+volumes:
+  mongo_data:
