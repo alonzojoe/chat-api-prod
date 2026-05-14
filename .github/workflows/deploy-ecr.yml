@@ -1,17 +1,14 @@
-# Configure AWS: add **AWS_DEPLOY_ROLE_ARN** as a repository *Variable* (Settings → Secrets and
-# variables → Actions → Variables) **or** *Secret* with the IAM role ARN from unicare_zone
-# `infra/github-actions` output `github_actions_ecr_role_arn`.
-#
-# The trust policy allows `repo:<github_org>/<github_repo>:*` — must match this repo (e.g. alonzojoe/chat-api).
+# Configure AWS: add AWS_DEPLOY_ROLE_ARN as a repository Variable (Settings → Secrets and
+# variables → Actions → Variables) with the IAM role ARN from this AWS account.
+# Trust policy on that role must allow repo:<github_org>/<github_repo>:* — alonzojoe/chat-api-prod.
 
-name: Test and push to ECR
+name: Test, push to ECR, deploy to ECS
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-# Required for OIDC (GitHub → AWS). Without `id-token: write`, credential loading fails.
 permissions:
   id-token: write
   contents: read
@@ -19,26 +16,29 @@ permissions:
 env:
   AWS_REGION: il-central-1
   ECR_REPOSITORY: chat-api-prod
+  ECS_CLUSTER: default
+  ECS_SERVICE: chat-api-prod-2e42
+  ECS_TASK_FAMILY: default-chat-api-prod-2e42
+  CONTAINER_NAME: Main
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: npm
-
       - run: npm ci
-
       - run: npm test
 
   build-and-push:
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.push.outputs.image }}
     steps:
       - uses: actions/checkout@v6
 
@@ -50,7 +50,7 @@ jobs:
         run: |
           ARN="${FROM_VAR:-$FROM_SECRET}"
           if [ -z "$ARN" ]; then
-            echo "::error::Set repository Variable or Secret AWS_DEPLOY_ROLE_ARN to the IAM role ARN (Terraform output github_actions_ecr_role_arn). See workflow header comment."
+            echo "::error::Set repository Variable AWS_DEPLOY_ROLE_ARN to the IAM role ARN."
             exit 1
           fi
           echo "arn=$ARN" >> "$GITHUB_OUTPUT"
@@ -67,6 +67,7 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2.1.1
 
       - name: Build, tag, and push image
+        id: push
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -76,3 +77,57 @@ jobs:
           docker tag "$ECR_REPOSITORY:latest" "$REGISTRY/$ECR_REPOSITORY:latest"
           docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve deploy role ARN
+        id: role
+        env:
+          FROM_VAR: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          FROM_SECRET: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          ARN="${FROM_VAR:-$FROM_SECRET}"
+          if [ -z "$ARN" ]; then
+            echo "::error::Set repository Variable AWS_DEPLOY_ROLE_ARN."
+            exit 1
+          fi
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_FAMILY" \
+            --query 'taskDefinition' \
+            --output json > task-def-raw.json
+          # Strip fields that register-task-definition rejects.
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)' \
+            task-def-raw.json > task-def.json
+
+      - name: Render task definition with new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v2
+        with:
+          task-definition: task-def.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
